@@ -27,6 +27,50 @@ export const xdrJsonReplacer = (_key: string, value: unknown): unknown => {
   return value;
 };
 
+/** A single candidate decoder: a display name plus the XDR type's `fromXDR`. */
+export interface XdrTypeAttempt {
+  name: string;
+  from: (raw: string, fmt: "base64") => unknown;
+}
+
+/**
+ * Issue #1277: the XDR types probed when inferring an unknown payload.
+ *
+ * Ordered most-specific/common first. The order doubles as the ranking used by
+ * {@link inferXdrTypes}: a `Transaction Envelope` beats a `Ledger Entry` when
+ * both manage to decode the same bytes.
+ *
+ * The `from` callbacks are arrow functions on purpose: the SDK's `fromXDR`
+ * statics are `this`-dependent, so a detached reference (`from: X.fromXDR`)
+ * throws inside the decoder and makes every probe fail.
+ */
+export const XDR_TYPE_ATTEMPTS: Array<XdrTypeAttempt> = [
+  {
+    name: "Transaction Envelope",
+    from: (raw, format) => xdr.TransactionEnvelope.fromXDR(raw, format),
+  },
+  {
+    name: "Transaction Result",
+    from: (raw, format) => xdr.TransactionResult.fromXDR(raw, format),
+  },
+  {
+    name: "Transaction Meta",
+    from: (raw, format) => xdr.TransactionMeta.fromXDR(raw, format),
+  },
+  {
+    name: "Soroban Value (ScVal)",
+    from: (raw, format) => xdr.ScVal.fromXDR(raw, format),
+  },
+  {
+    name: "Ledger Entry",
+    from: (raw, format) => xdr.LedgerEntry.fromXDR(raw, format),
+  },
+  {
+    name: "Soroban Auth",
+    from: (raw, format) => xdr.SorobanAuthorizationEntry.fromXDR(raw, format),
+  },
+];
+
 /**
  * Best-effort XDR decoder used by FE-680 / W7-FE-002.
  *
@@ -39,16 +83,7 @@ export const xdrJsonReplacer = (_key: string, value: unknown): unknown => {
 export function decodeXdr(base64Xdr: string): DecodedXdr | null {
   if (!base64Xdr || typeof base64Xdr !== "string") return null;
 
-  const attempts: Array<{ name: string; from: (raw: string, fmt: "base64") => unknown }> = [
-    { name: "Transaction Envelope", from: xdr.TransactionEnvelope.fromXDR },
-    { name: "Transaction Result",   from: xdr.TransactionResult.fromXDR },
-    { name: "Transaction Meta",     from: xdr.TransactionMeta.fromXDR },
-    { name: "Soroban Value (ScVal)", from: xdr.ScVal.fromXDR },
-    { name: "Ledger Entry",         from: xdr.LedgerEntry.fromXDR },
-    { name: "Soroban Auth",         from: xdr.SorobanAuthorizationEntry.fromXDR },
-  ];
-
-  for (const attempt of attempts) {
+  for (const attempt of XDR_TYPE_ATTEMPTS) {
     try {
       const parsed = attempt.from(base64Xdr, "base64");
       return {
@@ -65,6 +100,58 @@ export function decodeXdr(base64Xdr: string): DecodedXdr | null {
   return null;
 }
 
+/** A ranked candidate from {@link inferXdrTypes}. */
+export interface XdrTypeCandidate extends DecodedXdr {
+  /** Position in the ranked list; 0 is the most likely type. */
+  rank: number;
+  /** `high` when exactly one type decoded, `ambiguous` when several did. */
+  confidence: "high" | "ambiguous";
+}
+
+/**
+ * Issue #1277: infer every XDR type that can decode `base64Xdr`, ranked.
+ *
+ * Unlike {@link decodeXdr}, which stops at the first plausible type, this
+ * reports *all* matches so callers can surface ambiguity (a payload that decodes
+ * as both a Transaction Meta and a Ledger Entry is worth flagging to the user).
+ *
+ * Each attempt is wrapped in try/catch, so a full pass costs one failed parse
+ * per non-matching type — well under the 200ms budget for the six known types.
+ */
+export function inferXdrTypes(base64Xdr: string): XdrTypeCandidate[] {
+  if (!base64Xdr || typeof base64Xdr !== "string") return [];
+
+  const matches: DecodedXdr[] = [];
+
+  for (const attempt of XDR_TYPE_ATTEMPTS) {
+    try {
+      const parsed = attempt.from(base64Xdr, "base64");
+      matches.push({
+        typeName: attempt.name,
+        parsed,
+        json: JSON.stringify(parsed, xdrJsonReplacer, 2),
+        raw: base64Xdr,
+      });
+    } catch {
+      // Type did not match; try the next candidate.
+    }
+  }
+
+  const confidence = matches.length === 1 ? "high" : "ambiguous";
+
+  return matches.map((match, rank) => ({ ...match, rank, confidence }));
+}
+
+/**
+ * Issue #1277: the single most likely XDR type for `base64Xdr`, or `null`.
+ *
+ * Equivalent to the head of {@link inferXdrTypes} and to {@link decodeXdr}
+ * (same probe order), which keeps the helpers consistent.
+ */
+export function inferXdrType(base64Xdr: string): XdrTypeCandidate | null {
+  return inferXdrTypes(base64Xdr)[0] ?? null;
+}
+
 export function encodeJsonToXdr(jsonString: string, type: XdrType): string {
   try {
     const obj = JSON.parse(jsonString);
@@ -75,7 +162,9 @@ export function encodeJsonToXdr(jsonString: string, type: XdrType): string {
           return xdr.TransactionEnvelope.fromXDR(obj, "base64").toXDR("base64");
         }
         if (typeof obj?.xdr === "string") {
-          return xdr.TransactionEnvelope.fromXDR(obj.xdr, "base64").toXDR("base64");
+          return xdr.TransactionEnvelope.fromXDR(obj.xdr, "base64").toXDR(
+            "base64",
+          );
         }
         throw new Error(
           "TransactionEnvelope encoding currently accepts base64 XDR only.",
@@ -91,7 +180,9 @@ export function encodeJsonToXdr(jsonString: string, type: XdrType): string {
         if (typeof obj?.xdr === "string") {
           return xdr.LedgerKey.fromXDR(obj.xdr, "base64").toXDR("base64");
         }
-        throw new Error("LedgerKey encoding currently accepts base64 XDR only.");
+        throw new Error(
+          "LedgerKey encoding currently accepts base64 XDR only.",
+        );
 
       default:
         throw new Error("Unsupported XDR type for encoding");
